@@ -18,6 +18,7 @@ from pipeline.stt import transcribe
 from pipeline.normalize import numbers_to_words
 from pipeline.translate import translate
 from pipeline.tts import tts
+from pipeline.validate import validate, print_report
 
 
 def step(n: int, msg: str):
@@ -92,11 +93,24 @@ def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
     final_video = output_dir / f"dubbed_{lang_name}.mp4"
     merge_audio_video(video_path, dubbed_audio, final_video)
 
+    step(6, "Validating dubbed audio")
+    original_transcript = " ".join(transcripts_src)
+    original_audio = output_dir / "audio_full.wav"
+    val_results = validate(
+        original_audio=original_audio,
+        dubbed_audio=dubbed_audio,
+        original_transcript=original_transcript,
+        target_lang=target_lang,
+        source_lang=source_lang,
+    )
+    print_report(val_results)
+
     print("\n" + "=" * 60)
     print("✅  DONE!")
-    print(f"   Output video : {final_video}")
-    print(f"   Source text  : {output_dir / 'transcript_source.txt'}")
-    print(f"   Target text  : {output_dir / 'transcript_target.txt'}")
+    print(f"   Output video  : {final_video}")
+    print(f"   Source text   : {output_dir / 'transcript_source.txt'}")
+    print(f"   Target text   : {output_dir / f'transcript_{target_lang}.txt'}")
+    print(f"   Validation    : {val_results['verdict']}")
     print("=" * 60)
     return final_video
 

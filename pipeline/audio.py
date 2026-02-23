@@ -64,8 +64,10 @@ def concat_audio(file_list: list[Path], output_path: Path) -> Path | None:
 def merge_audio_video(video_path: Path, audio_path: Path, output_path: Path) -> Path:
     """
     Replace video's audio track with dubbed audio.
-    Pads silence if dubbed audio is shorter than video.
-    If dubbed audio is longer, video plays fully then goes silent.
+    Adjusts video frame speed to exactly match dubbed audio duration:
+      - Dubbed audio shorter → video slows down to fill it
+      - Dubbed audio longer  → video speeds up to match it
+    Result: audio and video always end at exactly the same time.
     """
     video_dur = get_duration(video_path)
     audio_dur = get_duration(audio_path)
@@ -73,15 +75,17 @@ def merge_audio_video(video_path: Path, audio_path: Path, output_path: Path) -> 
     if audio_dur == 0:
         raise RuntimeError("Dubbed audio file is empty")
 
-    print(f"  → Video: {video_dur:.1f}s | Dubbed audio: {audio_dur:.1f}s")
+    # pts_factor > 1 = slow down video, < 1 = speed up video
+    pts_factor = audio_dur / video_dur
+    print(f"  → Video: {video_dur:.1f}s | Dubbed audio: {audio_dur:.1f}s | "
+          f"Video speed: {1/pts_factor:.2f}x")
 
     run(["ffmpeg", "-y",
          "-i", str(video_path),
          "-i", str(audio_path),
-         "-c:v", "copy",
+         "-filter:v", f"setpts={pts_factor:.6f}*PTS",  # adjust frame timing
          "-map", "0:v:0",
          "-map", "1:a:0",
-         "-af", f"apad=whole_dur={video_dur:.3f}",  # pad silence to fill video
          "-shortest",
          str(output_path)])
     return output_path
