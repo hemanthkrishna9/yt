@@ -1,3 +1,11 @@
 yt-dlp
 requests
 python-dotenv
+num2words
+google-genai
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+beautifulsoup4
+lxml
+pydantic

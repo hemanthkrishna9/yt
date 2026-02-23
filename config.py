@@ -26,3 +26,21 @@ LANGUAGES = {
 }
 
 HEADERS = {"api-subscription-key": SARVAM_API_KEY}
+
+# ── Phase 2: Story Shorts ──────────────────────────────────────────────────
+GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL          = "gemini-2.0-flash"
+IMAGEN_MODEL          = "imagen-3.0-generate-002"
+
+YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET_PATH", "client_secret.json")
+YOUTUBE_TOKEN_CACHE   = "token.json"
+
+# Mood → TTS pace multiplier
+MOOD_PACE = {
+    "calm":       0.85,
+    "curious":    0.88,
+    "cheerful":   1.10,
+    "dramatic":   1.00,
+    "emotional":  0.75,
+    "default":    1.00,
+}

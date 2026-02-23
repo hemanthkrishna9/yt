@@ -105,6 +105,66 @@ def validate(
     return results
 
 
+def validate_short(
+    video_path: Path,
+    min_duration: float = 15.0,
+    max_duration: float = 180.0,
+) -> dict:
+    """
+    Validate a Story Short video before upload.
+    Checks: file size, duration range (15s–3min), video+audio streams, resolution.
+    """
+    import json, subprocess
+
+    results = {"checks": {}, "passed": True, "verdict": ""}
+
+    def check(name: str, passed: bool, detail: str):
+        results["checks"][name] = {"passed": passed, "detail": detail}
+        if not passed:
+            results["passed"] = False
+
+    # 1. File exists and > 500 KB
+    if not video_path.exists():
+        check("file_exists", False, "File not found")
+        results["verdict"] = "FAIL — video file missing"
+        return results
+    size_kb = video_path.stat().st_size // 1024
+    check("file_exists", size_kb > 500, f"{video_path.name} ({size_kb} KB)")
+
+    # 2. Duration
+    dur = get_duration(video_path)
+    dur_ok = min_duration <= dur <= max_duration
+    check("duration", dur_ok,
+          f"{dur:.1f}s (expected {min_duration}s–{max_duration}s)")
+
+    # 3. Video + audio streams
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", str(video_path)],
+        capture_output=True, text=True
+    )
+    streams = json.loads(r.stdout).get("streams", [])
+    has_video = any(s["codec_type"] == "video" for s in streams)
+    has_audio = any(s["codec_type"] == "audio" for s in streams)
+    check("has_video_stream", has_video, "video stream present" if has_video else "MISSING")
+    check("has_audio_stream", has_audio, "audio stream present" if has_audio else "MISSING")
+
+    # 4. Resolution check (should be 1080x1920)
+    video_stream = next((s for s in streams if s["codec_type"] == "video"), None)
+    if video_stream:
+        w = video_stream.get("width", 0)
+        h = video_stream.get("height", 0)
+        res_ok = w == 1080 and h == 1920
+        check("resolution", res_ok, f"{w}x{h} (expected 1080x1920)")
+
+    passed_count = sum(1 for c in results["checks"].values() if c["passed"])
+    total = len(results["checks"])
+    results["verdict"] = (
+        f"{'PASS' if results['passed'] else 'FAIL'} — {passed_count}/{total} checks passed"
+    )
+    return results
+
+
 def print_report(results: dict):
     """Pretty-print the validation report."""
     print("\n" + "─" * 60)

@@ -8,7 +8,7 @@ from pathlib import Path
 from config import HEADERS, TTS_MODEL
 
 
-def tts(text: str, target_lang: str, speaker: str, out_base: Path) -> list[Path]:
+def tts(text: str, target_lang: str, speaker: str, out_base: Path, pace: float = 1.0) -> list[Path]:
     """
     Generate TTS audio from text.
     Splits into ≤490-char sentence batches.
@@ -41,7 +41,7 @@ def tts(text: str, target_lang: str, speaker: str, out_base: Path) -> list[Path]
                 "target_language_code": target_lang,
                 "speaker": speaker,
                 "model": TTS_MODEL,
-                "pace": 1.0,
+                "pace": pace,
                 "speech_sample_rate": 22050,
             },
         )
