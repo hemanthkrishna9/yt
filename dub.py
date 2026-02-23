@@ -15,6 +15,7 @@ from config import LANGUAGES
 from pipeline.downloader import download_video
 from pipeline.audio import extract_audio, split_audio, concat_audio, merge_audio_video
 from pipeline.stt import transcribe
+from pipeline.normalize import numbers_to_words
 from pipeline.translate import translate
 from pipeline.tts import tts
 
@@ -49,6 +50,7 @@ def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
         else:
             print("  → STT: transcribing...")
             src_text = transcribe(chunk, source_lang)
+            src_text = numbers_to_words(src_text)  # "2003" → "two thousand and three"
             cache_src.write_text(src_text, encoding="utf-8")
         print(f"  → SRC: {src_text[:100]}...")
         transcripts_src.append(src_text)
@@ -64,16 +66,17 @@ def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
         print(f"  → TGT: {tgt_text[:100]}...")
         transcripts_tgt.append(tgt_text)
 
-        # TTS
+        # TTS (language-keyed to avoid cross-language cache collision)
         print("  → TTS: generating speech...")
-        tts_files = tts(tgt_text, target_lang, speaker, output_dir / f"tts_{i:03d}")
+        tts_files = tts(tgt_text, target_lang, speaker,
+                        output_dir / f"tts_{target_lang}_{i:03d}")
         all_tts_files.extend(tts_files)
         print(f"  → TTS: {len(tts_files)} segment(s)")
 
-    # Save full transcripts
+    # Save full transcripts (language-keyed)
     (output_dir / "transcript_source.txt").write_text(
         "\n\n".join(transcripts_src), encoding="utf-8")
-    (output_dir / "transcript_target.txt").write_text(
+    (output_dir / f"transcript_{target_lang}.txt").write_text(
         "\n\n".join(transcripts_tgt), encoding="utf-8")
 
     step(4, "Concatenating TTS audio")
