@@ -9,3 +9,10 @@ google-auth-oauthlib
 beautifulsoup4
 lxml
 pydantic
+filelock
+fastapi
+uvicorn[standard]
+python-multipart
+PyJWT
+bcrypt
+email-validator

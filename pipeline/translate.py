@@ -3,11 +3,39 @@
 import time
 import requests
 
-from config import HEADERS
+from config import HEADERS, SARVAM_REQUEST_DELAY
+from pipeline.log import get_logger
+from pipeline.retry import retry, check_response, APIError, sarvam_limiter
+
+log = get_logger(__name__)
+
+
+@retry(max_attempts=4, base_delay=0.5)
+def _translate_batch(batch: str, source_lang: str, target_lang: str) -> str:
+    """Translate a single batch with retry."""
+    sarvam_limiter.wait()
+    url = "https://api.sarvam.ai/translate"
+    resp = requests.post(
+        url,
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json={
+            "input": batch,
+            "source_language_code": source_lang,
+            "target_language_code": target_lang,
+            "model": "mayura:v1",
+            "enable_preprocessing": True,
+        },
+        timeout=30,
+    )
+    check_response(resp, "Sarvam Translate")
+    return resp.json().get("translated_text", batch)
 
 
 def translate(text: str, source_lang: str, target_lang: str) -> str:
-    """Translate text in safe 900-char batches."""
+    """Translate text in safe 900-char batches.
+
+    Raises APIError if any batch fails after retries.
+    """
     if not text.strip():
         return ""
 
@@ -24,24 +52,14 @@ def translate(text: str, source_lang: str, target_lang: str) -> str:
         batches.append(" ".join(cur))
 
     translated = []
-    url = "https://api.sarvam.ai/translate"
-    for batch in batches:
-        resp = requests.post(
-            url,
-            headers={**HEADERS, "Content-Type": "application/json"},
-            json={
-                "input": batch,
-                "source_language_code": source_lang,
-                "target_language_code": target_lang,
-                "model": "mayura:v1",
-                "enable_preprocessing": True,
-            },
-        )
-        if resp.status_code != 200:
-            print(f"  ✗ Translate error {resp.status_code}: {resp.text[:200]}")
-            translated.append(batch)  # fallback: keep original
-        else:
-            translated.append(resp.json().get("translated_text", batch))
-        time.sleep(0.2)
+    for i, batch in enumerate(batches):
+        try:
+            result = _translate_batch(batch, source_lang, target_lang)
+            translated.append(result)
+        except APIError:
+            log.error(f"Translation failed on batch {i+1}/{len(batches)}",
+                      extra={"api": "sarvam_translate", "chunk": i})
+            raise
+        time.sleep(SARVAM_REQUEST_DELAY)
 
     return " ".join(translated)

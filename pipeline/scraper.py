@@ -12,6 +12,11 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from filelock import FileLock
+
+from pipeline.log import get_logger
+
+log = get_logger(__name__)
 
 CACHE_DIR = Path("output/.story_cache")
 CACHE_TTL_DAYS = 7
@@ -20,23 +25,19 @@ HEADERS = {"User-Agent": "StoryShorts-Pipeline/1.0 (educational use)"}
 SOURCES = {
     "aesop": {
         "url": "https://www.gutenberg.org/files/21/21-0.txt",
-        "type": "gutenberg",
-        "split_pattern": r"\n\n([A-Z][A-Z ,'-]+)\n\n",
+        "type": "gutenberg_title_case",
     },
     "panchatantra": {
         "url": "https://www.gutenberg.org/files/12455/12455-0.txt",
-        "type": "gutenberg",
-        "split_pattern": r"\n\n([A-Z][A-Z ,'-]+)\n\n",
+        "type": "gutenberg_title_case",
     },
     "vikram": {
         "url": "https://www.gutenberg.org/files/1460/1460-0.txt",
-        "type": "gutenberg",
-        "split_pattern": r"\n\n(TALE THE [A-Z]+[^\n]*)\n",
+        "type": "gutenberg_title_case",
     },
     "tenali": {
         "url": "https://archive.org/stream/StoriesOfTenaliRaman-English/story-tenali_djvu.txt",
-        "type": "archive",
-        "split_pattern": r"\n([A-Z][A-Za-z ]+)\n\n",
+        "type": "gutenberg_title_case",
     },
     "jataka": {
         "url": "https://www.sacred-texts.com/bud/j1/",
@@ -65,27 +66,58 @@ def _fetch_text(url: str) -> str:
     return resp.text
 
 
-def _parse_gutenberg(raw: str, pattern: str) -> dict[str, str]:
-    """Split a Gutenberg plain text into {title: story_body}."""
+def _parse_gutenberg(raw: str) -> dict[str, str]:
+    """
+    Split a Gutenberg plain text into {title: story_body}.
+    Handles Title Case story titles followed by blank lines + body text.
+    """
     # Strip Project Gutenberg header/footer
     start = raw.find("*** START OF")
     end   = raw.find("*** END OF")
     if start != -1:
-        raw = raw[start:]
+        raw = raw[raw.find("\n", start):]
     if end != -1:
         raw = raw[:end]
 
     stories = {}
-    parts = re.split(pattern, raw)
-    # parts = [preamble, title1, body1, title2, body2, ...]
-    i = 1
-    while i + 1 < len(parts):
-        title = parts[i].strip()
-        body  = parts[i + 1].strip()
-        # Only keep stories with meaningful length (100–2000 chars)
-        if 100 <= len(body) <= 3000:
-            stories[title] = body[:2000]
-        i += 2
+    lines = raw.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # A story title: Title Case, 3-80 chars, not a sentence (no period mid-line)
+        if (
+            3 < len(line) <= 80
+            and re.match(r'^[A-Z][A-Za-z ,\'\-&]+$', line)
+            and not line.isupper()          # skip ALL CAPS headers
+            and "." not in line             # skip sentences
+            and sum(1 for c in line if c.isupper()) >= 1
+        ):
+            # Check next line is blank (title followed by empty line)
+            if i + 1 < len(lines) and lines[i + 1].strip() == "":
+                # Collect body until next candidate title or 2000 chars
+                body_lines = []
+                j = i + 2
+                while j < len(lines):
+                    next_line = lines[j].strip()
+                    # Stop at next title candidate
+                    if (
+                        3 < len(next_line) <= 80
+                        and re.match(r'^[A-Z][A-Za-z ,\'\-&]+$', next_line)
+                        and not next_line.isupper()
+                        and j + 1 < len(lines) and lines[j + 1].strip() == ""
+                    ):
+                        break
+                    body_lines.append(lines[j])
+                    j += 1
+
+                body = " ".join(b.strip() for b in body_lines if b.strip())
+                body = re.sub(r'\s+', ' ', body).strip()
+
+                if 80 <= len(body) <= 3000:
+                    stories[line] = body[:2000]
+                i = j
+                continue
+        i += 1
 
     return stories
 
@@ -117,34 +149,38 @@ def _parse_jataka(index_url: str) -> dict[str, str]:
 
 
 def _build_index(theme: str) -> dict[str, str]:
-    """Download and parse stories for a theme. Cache results."""
+    """Download and parse stories for a theme. Cache results with file locking."""
     src = SOURCES[theme]
     txt_path, idx_path = _cache_path(theme)
+    lock_path = idx_path.with_suffix(".lock")
 
     if src["type"] == "jataka_index":
         stories = _parse_jataka(src["url"])
     else:
         if not _is_fresh(txt_path):
-            print(f"  → Downloading {theme} stories from {src['url']}...")
+            log.info(f"Downloading {theme} stories from {src['url']}...")
             raw = _fetch_text(src["url"])
             txt_path.write_text(raw, encoding="utf-8")
         else:
             raw = txt_path.read_text(encoding="utf-8")
 
-        stories = _parse_gutenberg(raw, src["split_pattern"])
+        stories = _parse_gutenberg(raw)
 
-    with open(idx_path, "wb") as f:
-        pickle.dump(stories, f)
+    with FileLock(lock_path, timeout=30):
+        with open(idx_path, "wb") as f:
+            pickle.dump(stories, f)
 
-    print(f"  → Cached {len(stories)} stories for theme '{theme}'")
+    log.info(f"Cached {len(stories)} stories for theme '{theme}'")
     return stories
 
 
 def _load_index(theme: str) -> dict[str, str]:
     _, idx_path = _cache_path(theme)
+    lock_path = idx_path.with_suffix(".lock")
     if _is_fresh(idx_path):
-        with open(idx_path, "rb") as f:
-            return pickle.load(f)
+        with FileLock(lock_path, timeout=30):
+            with open(idx_path, "rb") as f:
+                return pickle.load(f)
     return _build_index(theme)
 
 
@@ -160,13 +196,13 @@ def fetch_story(theme: str, keyword: str = None) -> tuple[str, str]:
     theme = theme.lower().strip()
 
     if theme not in SOURCES:
-        print(f"  → Unknown theme '{theme}'. Available: {', '.join(SOURCES)}")
+        log.warning(f"Unknown theme '{theme}'. Available: {', '.join(SOURCES)}")
         return "", ""
 
     try:
         stories = _load_index(theme)
     except Exception as e:
-        print(f"  → Failed to fetch stories: {e}")
+        log.error(f"Failed to fetch stories: {e}")
         return "", ""
 
     if not stories:
@@ -177,7 +213,7 @@ def fetch_story(theme: str, keyword: str = None) -> tuple[str, str]:
         filtered = {t: s for t, s in stories.items()
                     if keyword.lower() in t.lower() or keyword.lower() in s.lower()}
         if not filtered:
-            print(f"  → No stories found for keyword '{keyword}' in theme '{theme}'")
+            log.info(f"No stories found for keyword '{keyword}' in theme '{theme}'")
             return "", ""
         stories = filtered
 

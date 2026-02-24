@@ -7,12 +7,12 @@ Usage:
   python story.py --theme aesop               --lang hi-IN --mood dramatic
   python story.py --theme panchatantra        --lang te-IN --no-upload
   python story.py --theme tenali              --lang ta-IN --speaker kavya
-  python story.py --theme xyz                 --lang en-IN   # → no results
+  python story.py --theme aesop --lang hi-IN --workers 4   # parallel scenes
 """
 
 import argparse
-import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -24,10 +24,32 @@ from pipeline.narrator import narrate_scenes
 from pipeline.composer import make_scene_clip, stitch_clips, generate_srt, burn_subtitles
 from pipeline.validate import validate_short, print_report
 from pipeline.publisher import upload_short
+from pipeline.log import get_logger
+from pipeline.retry import APIError
+
+log = get_logger(__name__)
 
 
 def step(n: int, msg: str):
     print(f"\n{'─'*60}\n[Step {n}] {msg}\n{'─'*60}")
+
+
+def _collect_intermediates(output_dir: Path) -> list[Path]:
+    """Collect intermediate files that can be cleaned up."""
+    intermediates = []
+    # TTS segment WAVs (intermediate batches)
+    intermediates.extend(output_dir.glob("narration_*_tts_*.wav"))
+    # Individual scene clips (kept as stitched.mp4 -> short.mp4)
+    intermediates.extend(output_dir.glob("clip_*.mp4"))
+    # Stitched video (short.mp4 is the final)
+    stitched = output_dir / "stitched.mp4"
+    if stitched.exists():
+        intermediates.append(stitched)
+    # Filter complex debug file
+    fc = output_dir / "filter_complex.txt"
+    if fc.exists():
+        intermediates.append(fc)
+    return intermediates
 
 
 def run_pipeline(
@@ -38,54 +60,88 @@ def run_pipeline(
     mood: str,
     output_dir: Path,
     no_upload: bool,
+    keep_intermediates: bool = False,
+    workers: int = 1,
 ) -> Path:
 
     # ── Step 1: Gemini scene breakdown ──────────────────────────────────────
     step(1, "Breaking story into scenes (Gemini)")
     breakdown_cache = output_dir / "breakdown.json"
     if breakdown_cache.exists():
-        print("  → Breakdown cached")
+        print("  -> Breakdown cached")
         from pipeline.formatter import StoryBreakdown
         breakdown = StoryBreakdown.model_validate_json(breakdown_cache.read_text())
     else:
         breakdown = breakdown_story(story_text, target_lang)
         breakdown_cache.write_text(breakdown.model_dump_json(indent=2), encoding="utf-8")
 
-    print(f"  → Title: {breakdown.title}")
-    print(f"  → Scenes: {len(breakdown.scenes)}")
-    print(f"  → Moral: {breakdown.moral}")
+    print(f"  -> Title: {breakdown.title}")
+    print(f"  -> Scenes: {len(breakdown.scenes)}")
+    print(f"  -> Moral: {breakdown.moral}")
 
     scenes = breakdown.scenes
+    n_scenes = len(scenes)
+    effective_workers = min(workers, n_scenes)
 
-    # ── Step 2: Generate images ──────────────────────────────────────────────
-    step(2, f"Generating {len(scenes)} scene images (Imagen 3)")
-    images = []
-    for scene in scenes:
-        img = generate_scene_image(scene.image_prompt, scene.scene_number, output_dir)
-        images.append(img)
+    # ── Step 2: Generate images (parallelizable) ─────────────────────────────
+    step(2, f"Generating {n_scenes} scene images (Imagen 3)"
+         + (f" [{effective_workers} workers]" if effective_workers > 1 else ""))
+    if effective_workers > 1:
+        images = [None] * n_scenes
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {
+                executor.submit(generate_scene_image, s.image_prompt,
+                                s.scene_number, output_dir): i
+                for i, s in enumerate(scenes)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                images[idx] = future.result()
+    else:
+        images = []
+        for scene in scenes:
+            img = generate_scene_image(scene.image_prompt, scene.scene_number, output_dir)
+            images.append(img)
 
-    # ── Step 3: TTS narration ────────────────────────────────────────────────
-    step(3, f"Narrating scenes in {LANGUAGES[target_lang][0]} (Sarvam TTS)")
-    narrations = narrate_scenes(scenes, target_lang, speaker, mood, output_dir)
+    # ── Step 3: TTS narration (parallelizable per scene) ──────────────────────
+    step(3, f"Narrating scenes in {LANGUAGES[target_lang][0]} (Sarvam TTS)"
+         + (f" [{effective_workers} workers]" if effective_workers > 1 else ""))
+    narrations = narrate_scenes(scenes, target_lang, speaker, mood, output_dir,
+                                workers=effective_workers)
     # narrations = [(wav_path, duration), ...]
 
-    # ── Step 4: Build scene clips (Ken Burns) ────────────────────────────────
-    step(4, "Building scene clips with Ken Burns effect (FFmpeg)")
-    clips = []
-    durations = []
-    for scene, img, (wav, dur) in zip(scenes, images, narrations):
-        clip = make_scene_clip(img, wav, dur, scene.scene_number, output_dir)
-        clips.append(clip)
-        durations.append(dur)
+    # ── Step 4: Build scene clips (Ken Burns, parallelizable) ─────────────────
+    step(4, "Building scene clips with Ken Burns effect (FFmpeg)"
+         + (f" [{effective_workers} workers]" if effective_workers > 1 else ""))
+    if effective_workers > 1:
+        clip_results = [None] * n_scenes
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {}
+            for i, (scene, img, (wav, dur)) in enumerate(zip(scenes, images, narrations)):
+                future = executor.submit(make_scene_clip, img, wav, dur,
+                                         scene.scene_number, output_dir)
+                futures[future] = (i, dur)
+            for future in as_completed(futures):
+                idx, dur = futures[future]
+                clip_results[idx] = (future.result(), dur)
+        clips = [r[0] for r in clip_results]
+        durations = [r[1] for r in clip_results]
+    else:
+        clips = []
+        durations = []
+        for scene, img, (wav, dur) in zip(scenes, images, narrations):
+            clip = make_scene_clip(img, wav, dur, scene.scene_number, output_dir)
+            clips.append(clip)
+            durations.append(dur)
 
-    # ── Step 5: Stitch clips + subtitles ────────────────────────────────────
+    # ── Step 5: Stitch clips + subtitles (sequential — depends on all clips) ──
     step(5, "Stitching clips + burning subtitles")
     stitched = stitch_clips(clips, durations, output_dir)
     srt = generate_srt(scenes, durations, output_dir)
     final_video = burn_subtitles(stitched, srt, output_dir)
 
     total_dur = sum(durations)
-    print(f"  → Final video: {final_video.name} ({total_dur:.1f}s)")
+    print(f"  -> Final video: {final_video.name} ({total_dur:.1f}s)")
 
     # ── Step 6: Validate ────────────────────────────────────────────────────
     step(6, "Validating output video")
@@ -107,6 +163,15 @@ def run_pipeline(
             tags=breakdown.youtube_tags,
         )
         (output_dir / "youtube_url.txt").write_text(url)
+
+    # Cleanup intermediate files
+    if not keep_intermediates:
+        intermediates = _collect_intermediates(output_dir)
+        if intermediates:
+            cleaned = sum(f.stat().st_size for f in intermediates if f.exists())
+            for f in intermediates:
+                f.unlink(missing_ok=True)
+            log.info(f"Cleaned up {len(intermediates)} intermediate files ({cleaned // 1024} KB)")
 
     print("\n" + "=" * 60)
     print("✅  DONE!")
@@ -130,7 +195,7 @@ def main():
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--text",  help="Story text (paste directly)")
-    group.add_argument("--theme", help=f"Auto-fetch theme. Options: aesop, panchatantra, tenali, jataka, vikram")
+    group.add_argument("--theme", help="Auto-fetch theme. Options: aesop, panchatantra, tenali, jataka, vikram")
 
     parser.add_argument("--lang",      required=True,
                         help=f"Target language. Options: {', '.join(LANGUAGES)}")
@@ -144,6 +209,10 @@ def main():
                         help="Skip YouTube upload, produce local file only")
     parser.add_argument("--output",    default=None,
                         help="Output directory override")
+    parser.add_argument("--keep-intermediates", action="store_true",
+                        help="Keep intermediate files (clips, TTS segments) for debugging")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel workers for scene processing (default: 4)")
 
     args = parser.parse_args()
 
@@ -167,7 +236,7 @@ def main():
     lang_name = LANGUAGES[args.lang][0]
     print("=" * 60)
     print("  Story Shorts")
-    print(f"  Language: {lang_name}  |  Speaker: {speaker}  |  Mood: {args.mood}")
+    print(f"  Language: {lang_name}  |  Speaker: {speaker}  |  Mood: {args.mood}  |  Workers: {args.workers}")
     print("=" * 60)
 
     # ── Get story text ───────────────────────────────────────────────────────
@@ -182,7 +251,7 @@ def main():
             print(f"\n❌  No results found for theme: '{args.theme}'")
             if args.keyword:
                 print(f"   Keyword filter: '{args.keyword}'")
-            print(f"   Available themes: aesop, panchatantra, tenali, jataka, vikram")
+            print("   Available themes: aesop, panchatantra, tenali, jataka, vikram")
             sys.exit(0)
         print(f"  Story: {story_title}")
         print(f"  Text:  {story_text[:100]}...")
@@ -198,15 +267,21 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "story_text.txt").write_text(story_text, encoding="utf-8")
 
-    run_pipeline(
-        story_text=story_text,
-        story_title=story_title,
-        target_lang=args.lang,
-        speaker=speaker,
-        mood=args.mood,
-        output_dir=output_dir,
-        no_upload=args.no_upload,
-    )
+    try:
+        run_pipeline(
+            story_text=story_text,
+            story_title=story_title,
+            target_lang=args.lang,
+            speaker=speaker,
+            mood=args.mood,
+            output_dir=output_dir,
+            no_upload=args.no_upload,
+            keep_intermediates=args.keep_intermediates,
+            workers=args.workers,
+        )
+    except APIError as e:
+        log.error(f"Pipeline failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

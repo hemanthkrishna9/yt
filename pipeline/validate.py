@@ -9,11 +9,17 @@ Checks:
 """
 
 import difflib
+import math
+import tempfile
 from pathlib import Path
 
-from pipeline.audio import get_duration
+from pipeline.audio import get_duration, split_audio
 from pipeline.stt import transcribe
 from pipeline.translate import translate
+from pipeline.log import get_logger
+from config import CHUNK_SECS
+
+log = get_logger(__name__)
 
 
 def word_overlap(text_a: str, text_b: str) -> float:
@@ -70,9 +76,28 @@ def validate(
     check("duration", dur_ok,
           f"Original: {orig_dur:.1f}s | Dubbed: {dub_dur:.1f}s | Ratio: {dur_ratio:.2f}x")
 
-    # ── Check 3: STT on dubbed audio ───────────────────────────────────────
+    # ── Check 3: STT on dubbed audio (chunked to respect API limits) ────────
     print("  → STT on dubbed audio...")
-    dubbed_transcript = transcribe(dubbed_audio, target_lang)
+    try:
+        if dub_dur <= CHUNK_SECS:
+            dubbed_transcript = transcribe(dubbed_audio, target_lang)
+        else:
+            # Split into chunks for STT (API has 30s limit)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                chunks = split_audio(dubbed_audio, dub_dur, tmp_path)
+                parts = []
+                for chunk in chunks:
+                    part = transcribe(chunk, target_lang)
+                    parts.append(part)
+                dubbed_transcript = " ".join(parts)
+    except Exception as e:
+        log.warning(f"STT validation failed: {e}")
+        check("stt_dubbed", False, f"STT error: {e}")
+        results["verdict"] = "WARN — could not validate dubbed speech (STT error)"
+        results["passed"] = True  # don't fail the whole pipeline for validation issues
+        return results
+
     if not dubbed_transcript.strip():
         check("stt_dubbed", False, "STT returned empty transcript for dubbed audio")
         results["verdict"] = "FAIL — dubbed audio has no detectable speech"

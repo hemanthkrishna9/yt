@@ -8,6 +8,10 @@ from google import genai
 from google.genai import types
 
 from config import GEMINI_API_KEY, GEMINI_MODEL, LANGUAGES
+from pipeline.log import get_logger
+from pipeline.retry import retry, APIError
+
+log = get_logger(__name__)
 
 
 class Scene(BaseModel):
@@ -32,10 +36,28 @@ class StoryBreakdown(BaseModel):
     youtube_tags: List[str] = Field(description="8-12 relevant tags.")
 
 
+@retry(max_attempts=3, base_delay=2.0, max_delay=30.0,
+       retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception))
+def _call_gemini(prompt: str) -> str:
+    """Call Gemini API with retry on transient failures."""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=StoryBreakdown,
+        ),
+    )
+    return response.text
+
+
 def breakdown_story(story_text: str, target_lang: str) -> StoryBreakdown:
     """
     Use Gemini to break a story into 5-8 scenes with image prompts.
     Narration is in the target language; image prompts always in English.
+
+    Raises APIError on persistent failure.
     """
     lang_name = LANGUAGES.get(target_lang, ("English",))[0]
 
@@ -58,22 +80,22 @@ STORY:
 {story_text}
 """
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=StoryBreakdown,
-        ),
-    )
+    try:
+        raw = _call_gemini(prompt)
+    except Exception as e:
+        raise APIError(
+            f"Gemini scene breakdown failed: {e}", api="gemini"
+        ) from e
 
-    breakdown = StoryBreakdown.model_validate_json(response.text)
+    breakdown = StoryBreakdown.model_validate_json(raw)
 
     # Fallback: if narration looks like English when it shouldn't be, flag it
     if target_lang != "en-IN":
         for scene in breakdown.scenes:
             if scene.narration.isascii():
-                print(f"  ⚠ Scene {scene.scene_number} narration may not be in {lang_name} — check breakdown.json")
+                log.warning(
+                    f"Scene {scene.scene_number} narration may not be in {lang_name}",
+                    extra={"scene": scene.scene_number, "lang": target_lang},
+                )
 
     return breakdown

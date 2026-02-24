@@ -13,6 +13,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 from config import YOUTUBE_CLIENT_SECRET, YOUTUBE_TOKEN_CACHE
+from pipeline.log import get_logger
+from pipeline.retry import retry, APIError
+
+log = get_logger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
@@ -32,7 +36,7 @@ def _get_youtube_client():
             if not Path(YOUTUBE_CLIENT_SECRET).exists():
                 raise FileNotFoundError(
                     f"YouTube client secret not found: {YOUTUBE_CLIENT_SECRET}\n"
-                    "Download it from Google Cloud Console → APIs → OAuth 2.0 credentials"
+                    "Download it from Google Cloud Console -> APIs -> OAuth 2.0 credentials"
                 )
             flow = InstalledAppFlow.from_client_secrets_file(YOUTUBE_CLIENT_SECRET, SCOPES)
             # Headless server support
@@ -47,6 +51,27 @@ def _get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
+@retry(max_attempts=3, base_delay=5.0, max_delay=60.0,
+       retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception))
+def _upload_with_retry(youtube, body, media) -> dict:
+    """Upload video with resumable upload + retry on transient errors."""
+    request = youtube.videos().insert(
+        part=",".join(body.keys()),
+        body=body,
+        media_body=media,
+    )
+
+    log.info("Uploading to YouTube (private)...")
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            pct = int(status.progress() * 100)
+            print(f"\r  \u2192 Upload progress: {pct}%", end="", flush=True)
+    print()
+    return response
+
+
 def upload_short(
     video_path: Path,
     title: str,
@@ -58,6 +83,8 @@ def upload_short(
     Upload video to YouTube.
     Returns the YouTube video URL.
     Always uploads as private — creator promotes manually.
+
+    Raises APIError on persistent failure.
     """
     youtube = _get_youtube_client()
 
@@ -81,22 +108,14 @@ def upload_short(
         chunksize=1024 * 1024,  # 1MB chunks
     )
 
-    request = youtube.videos().insert(
-        part=",".join(body.keys()),
-        body=body,
-        media_body=media,
-    )
-
-    print("  → Uploading to YouTube (private)...")
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            pct = int(status.progress() * 100)
-            print(f"\r  → Upload progress: {pct}%", end="", flush=True)
-    print()
+    try:
+        response = _upload_with_retry(youtube, body, media)
+    except Exception as e:
+        raise APIError(
+            f"YouTube upload failed: {e}", api="youtube"
+        ) from e
 
     video_id = response["id"]
     url = f"https://www.youtube.com/shorts/{video_id}"
-    print(f"  → Uploaded: {url}")
+    log.info(f"Uploaded: {url}")
     return url

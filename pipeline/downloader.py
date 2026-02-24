@@ -3,6 +3,10 @@
 import yt_dlp
 from pathlib import Path
 
+from pipeline.log import get_logger
+
+log = get_logger(__name__)
+
 
 def download_video(url: str, output_dir: Path) -> tuple[Path, str]:
     """
@@ -28,5 +32,5 @@ def download_video(url: str, output_dir: Path) -> tuple[Path, str]:
     if not video_path.exists():
         raise FileNotFoundError(f"Download failed — file not found: {video_path}")
 
-    print(f"  → Downloaded: {title}")
+    log.info(f"Downloaded: {title}")
     return video_path, title

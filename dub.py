@@ -5,10 +5,13 @@ Usage:
   python dub.py --url  "https://youtube.com/shorts/..."  --target te-IN
   python dub.py --file /path/to/video.mp4               --target hi-IN
   python dub.py --url  "..."  --source en-IN --target ta-IN --speaker thendral
+  python dub.py --url  "..."  --target hi-IN --workers 8   # parallel chunks
 """
 
 import argparse
 import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from config import LANGUAGES
@@ -19,14 +22,67 @@ from pipeline.normalize import numbers_to_words
 from pipeline.translate import translate
 from pipeline.tts import tts
 from pipeline.validate import validate, print_report
+from pipeline.log import get_logger
+from pipeline.retry import APIError
+
+log = get_logger(__name__)
 
 
 def step(n: int, msg: str):
     print(f"\n{'─'*60}\n[Step {n}] {msg}\n{'─'*60}")
 
 
+def _collect_intermediates(output_dir: Path, target_lang: str) -> list[Path]:
+    """Collect intermediate files that can be cleaned up."""
+    intermediates = []
+    # Chunk WAVs
+    intermediates.extend(output_dir.glob("chunk_*.wav"))
+    # TTS segment WAVs
+    intermediates.extend(output_dir.glob(f"tts_{target_lang}_*_tts_*.wav"))
+    return intermediates
+
+
+def _process_chunk(i: int, chunk: Path, source_lang: str, target_lang: str,
+                   speaker: str, output_dir: Path) -> tuple[int, str, str, list[Path]]:
+    """Process a single chunk: STT → normalize → translate → TTS.
+
+    Returns (chunk_index, src_text, tgt_text, tts_files).
+    Thread-safe — each chunk uses its own file paths.
+    """
+    cache_src = output_dir / f"transcript_src_{i:03d}.txt"
+    cache_tgt = output_dir / f"transcript_tgt_{target_lang}_{i:03d}.txt"
+
+    # STT
+    if cache_src.exists():
+        src_text = cache_src.read_text(encoding="utf-8")
+        log.info(f"Chunk {i}: STT (cached)")
+    else:
+        log.info(f"Chunk {i}: STT transcribing...")
+        src_text = transcribe(chunk, source_lang)
+        src_text = numbers_to_words(src_text)
+        cache_src.write_text(src_text, encoding="utf-8")
+
+    # Translate
+    if cache_tgt.exists():
+        tgt_text = cache_tgt.read_text(encoding="utf-8")
+        log.info(f"Chunk {i}: Translate (cached)")
+    else:
+        log.info(f"Chunk {i}: translating...")
+        tgt_text = translate(src_text, source_lang, target_lang)
+        cache_tgt.write_text(tgt_text, encoding="utf-8")
+
+    # TTS
+    log.info(f"Chunk {i}: generating TTS...")
+    tts_files = tts(tgt_text, target_lang, speaker,
+                    output_dir / f"tts_{target_lang}_{i:03d}")
+    log.info(f"Chunk {i}: done ({len(tts_files)} TTS segments)")
+
+    return i, src_text, tgt_text, tts_files
+
+
 def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
-                 speaker: str, output_dir: Path):
+                 speaker: str, output_dir: Path, keep_intermediates: bool = False,
+                 workers: int = 1):
 
     step(1, "Extracting audio")
     audio_path, duration = extract_audio(video_path, output_dir)
@@ -34,45 +90,77 @@ def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
     step(2, "Splitting audio into chunks")
     chunks = split_audio(audio_path, duration, output_dir)
 
-    step(3, f"STT → Translate → TTS  ({len(chunks)} chunk(s))")
-    all_tts_files = []
-    transcripts_src, transcripts_tgt = [], []
+    n_chunks = len(chunks)
+    effective_workers = min(workers, n_chunks)
 
-    for i, chunk in enumerate(chunks):
-        print(f"\n  Chunk {i+1}/{len(chunks)} ───────────────────")
+    if effective_workers > 1:
+        step(3, f"STT → Translate → TTS  ({n_chunks} chunk(s), {effective_workers} workers)")
+        # Parallel processing — results collected by chunk index for correct ordering
+        results = {}
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {
+                executor.submit(_process_chunk, i, chunk, source_lang,
+                                target_lang, speaker, output_dir): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    log.error(f"Chunk {idx} failed: {e}")
+                    raise
 
-        cache_src = output_dir / f"transcript_src_{i:03d}.txt"
-        cache_tgt = output_dir / f"transcript_tgt_{target_lang}_{i:03d}.txt"
+        # Reassemble in order
+        transcripts_src = []
+        transcripts_tgt = []
+        all_tts_files = []
+        for i in range(n_chunks):
+            _, src_text, tgt_text, tts_files = results[i]
+            transcripts_src.append(src_text)
+            transcripts_tgt.append(tgt_text)
+            all_tts_files.extend(tts_files)
+            print(f"  Chunk {i+1}: SRC={src_text[:60]}... | TTS={len(tts_files)} segs")
+    else:
+        step(3, f"STT → Translate → TTS  ({n_chunks} chunk(s))")
+        all_tts_files = []
+        transcripts_src, transcripts_tgt = [], []
 
-        # STT
-        if cache_src.exists():
-            src_text = cache_src.read_text(encoding="utf-8")
-            print("  → STT: (cached)")
-        else:
-            print("  → STT: transcribing...")
-            src_text = transcribe(chunk, source_lang)
-            src_text = numbers_to_words(src_text)  # "2003" → "two thousand and three"
-            cache_src.write_text(src_text, encoding="utf-8")
-        print(f"  → SRC: {src_text[:100]}...")
-        transcripts_src.append(src_text)
+        for i, chunk in enumerate(chunks):
+            print(f"\n  Chunk {i+1}/{n_chunks} ───────────────────")
 
-        # Translate
-        if cache_tgt.exists():
-            tgt_text = cache_tgt.read_text(encoding="utf-8")
-            print("  → Translate: (cached)")
-        else:
-            print("  → Translate: translating...")
-            tgt_text = translate(src_text, source_lang, target_lang)
-            cache_tgt.write_text(tgt_text, encoding="utf-8")
-        print(f"  → TGT: {tgt_text[:100]}...")
-        transcripts_tgt.append(tgt_text)
+            cache_src = output_dir / f"transcript_src_{i:03d}.txt"
+            cache_tgt = output_dir / f"transcript_tgt_{target_lang}_{i:03d}.txt"
 
-        # TTS (language-keyed to avoid cross-language cache collision)
-        print("  → TTS: generating speech...")
-        tts_files = tts(tgt_text, target_lang, speaker,
-                        output_dir / f"tts_{target_lang}_{i:03d}")
-        all_tts_files.extend(tts_files)
-        print(f"  → TTS: {len(tts_files)} segment(s)")
+            # STT
+            if cache_src.exists():
+                src_text = cache_src.read_text(encoding="utf-8")
+                print("  → STT: (cached)")
+            else:
+                print("  → STT: transcribing...")
+                src_text = transcribe(chunk, source_lang)
+                src_text = numbers_to_words(src_text)
+                cache_src.write_text(src_text, encoding="utf-8")
+            print(f"  → SRC: {src_text[:100]}...")
+            transcripts_src.append(src_text)
+
+            # Translate
+            if cache_tgt.exists():
+                tgt_text = cache_tgt.read_text(encoding="utf-8")
+                print("  → Translate: (cached)")
+            else:
+                print("  → Translate: translating...")
+                tgt_text = translate(src_text, source_lang, target_lang)
+                cache_tgt.write_text(tgt_text, encoding="utf-8")
+            print(f"  → TGT: {tgt_text[:100]}...")
+            transcripts_tgt.append(tgt_text)
+
+            # TTS
+            print("  → TTS: generating speech...")
+            tts_files = tts(tgt_text, target_lang, speaker,
+                            output_dir / f"tts_{target_lang}_{i:03d}")
+            all_tts_files.extend(tts_files)
+            print(f"  → TTS: {len(tts_files)} segment(s)")
 
     # Save full transcripts (language-keyed)
     (output_dir / "transcript_source.txt").write_text(
@@ -105,6 +193,15 @@ def run_pipeline(video_path: Path, source_lang: str, target_lang: str,
     )
     print_report(val_results)
 
+    # Cleanup intermediate files
+    if not keep_intermediates:
+        intermediates = _collect_intermediates(output_dir, target_lang)
+        if intermediates:
+            cleaned = sum(f.stat().st_size for f in intermediates if f.exists())
+            for f in intermediates:
+                f.unlink(missing_ok=True)
+            log.info(f"Cleaned up {len(intermediates)} intermediate files ({cleaned // 1024} KB)")
+
     print("\n" + "=" * 60)
     print("✅  DONE!")
     print(f"   Output video  : {final_video}")
@@ -129,6 +226,10 @@ def main():
                         help="TTS speaker name (auto-selected if not set)")
     parser.add_argument("--output",  default=None,
                         help="Output directory (default: output/<video_title>)")
+    parser.add_argument("--keep-intermediates", action="store_true",
+                        help="Keep intermediate files (chunks, TTS segments) for debugging")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel workers for chunk processing (default: 4)")
 
     args = parser.parse_args()
 
@@ -152,21 +253,29 @@ def main():
     tgt_name = LANGUAGES[args.target][0]
     print("=" * 60)
     print("  YT Dubber")
-    print(f"  {src_name} → {tgt_name}  |  Speaker: {speaker}")
+    print(f"  {src_name} → {tgt_name}  |  Speaker: {speaker}  |  Workers: {args.workers}")
     print("=" * 60)
 
-    # Get video file
+    # Get video file — each download gets a unique temp dir to prevent race conditions
     if args.url:
         print(f"\nDownloading: {args.url}")
-        base_output = Path("output") / "download"
-        video_path, title = download_video(args.url, base_output)
-        output_dir = Path("output") / title[:50].replace(" ", "_").replace("/", "_")
+        job_id = uuid.uuid4().hex[:8]
+        download_dir = Path("output") / "download" / f"job_{job_id}"
+        video_path, title = download_video(args.url, download_dir)
+        output_dir = Path(args.output) if args.output else (
+            Path("output") / title[:50].replace(" ", "_").replace("/", "_")
+        )
         # Move video to final output dir
         output_dir.mkdir(parents=True, exist_ok=True)
         final_video_path = output_dir / "source.mp4"
         if not final_video_path.exists():
             video_path.rename(final_video_path)
         video_path = final_video_path
+        # Clean up empty download dir
+        try:
+            download_dir.rmdir()
+        except OSError:
+            pass
     else:
         video_path = Path(args.file)
         if not video_path.exists():
@@ -175,7 +284,13 @@ def main():
         output_dir = Path(args.output or f"output/{video_path.stem}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    run_pipeline(video_path, args.source, args.target, speaker, output_dir)
+    try:
+        run_pipeline(video_path, args.source, args.target, speaker, output_dir,
+                     keep_intermediates=args.keep_intermediates,
+                     workers=args.workers)
+    except APIError as e:
+        log.error(f"Pipeline failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,15 @@
 Imagen 3 image generation — one 9:16 image per scene.
 """
 
-import time
 from pathlib import Path
 from google import genai
 from google.genai import types
 
 from config import GEMINI_API_KEY, IMAGEN_MODEL
+from pipeline.log import get_logger
+from pipeline.retry import retry, APIError
+
+log = get_logger(__name__)
 
 # Words that commonly trigger Imagen 3 safety filters in folk stories
 _BLOCKED_WORDS = [
@@ -51,6 +54,25 @@ def _sanitize_prompt(prompt: str) -> str:
     return result
 
 
+@retry(max_attempts=4, base_delay=1.0, max_delay=15.0,
+       retryable_exceptions=(ConnectionError, TimeoutError, OSError, RuntimeError, Exception))
+def _generate_image(full_prompt: str) -> bytes:
+    """Call Imagen 3 API with retry. Returns image bytes."""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    response = client.models.generate_images(
+        model=IMAGEN_MODEL,
+        prompt=full_prompt,
+        config=types.GenerateImagesConfig(
+            number_of_images=1,
+            aspect_ratio="9:16",
+            output_mime_type="image/jpeg",
+        ),
+    )
+    if not response.generated_images:
+        raise RuntimeError("No image returned (safety filter likely triggered)")
+    return response.generated_images[0].image.image_bytes
+
+
 def generate_scene_image(
     prompt: str,
     scene_index: int,
@@ -59,44 +81,32 @@ def generate_scene_image(
     """
     Generate one 9:16 image for a scene using Imagen 3.
     Returns path to saved JPEG. Caches — skips if file exists.
+
+    Tries sanitized prompt first, falls back to generic prompt on failure.
+    Raises APIError if all attempts fail.
     """
     out_path = output_dir / f"scene_{scene_index:02d}.jpg"
     if out_path.exists():
-        print(f"  → Scene {scene_index:02d}: image cached")
+        log.info(f"Scene {scene_index:02d}: image cached")
         return out_path
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
     sanitized = _sanitize_prompt(prompt)
     full_prompt = _STYLE_PREFIX + sanitized
 
-    for attempt in range(3):
+    try:
+        img_bytes = _generate_image(full_prompt)
+    except Exception:
+        log.warning(f"Scene {scene_index:02d}: primary prompt failed, trying fallback",
+                    extra={"scene": scene_index})
         try:
-            response = client.models.generate_images(
-                model=IMAGEN_MODEL,
-                prompt=full_prompt,
-                config=types.GenerateImagesConfig(
-                    number_of_images=1,
-                    aspect_ratio="9:16",
-                    output_mime_type="image/jpeg",
-                ),
-            )
-
-            if response.generated_images:
-                img_bytes = response.generated_images[0].image.image_bytes
-                out_path.write_bytes(img_bytes)
-                print(f"  → Scene {scene_index:02d}: image saved ({len(img_bytes)//1024} KB)")
-                return out_path
-
-            # No images returned — safety filter likely
-            print(f"  ⚠ Scene {scene_index:02d}: no image returned (attempt {attempt+1}), using fallback prompt")
-            full_prompt = _STYLE_PREFIX + _FALLBACK_PROMPT
-
+            img_bytes = _generate_image(_STYLE_PREFIX + _FALLBACK_PROMPT)
         except Exception as e:
-            print(f"  ✗ Scene {scene_index:02d}: image error (attempt {attempt+1}): {e}")
-            full_prompt = _STYLE_PREFIX + _FALLBACK_PROMPT
+            raise APIError(
+                f"Could not generate image for scene {scene_index}: {e}",
+                api="imagen3",
+            ) from e
 
-        time.sleep(1)
-
-    # All retries failed — save a placeholder
-    print(f"  ✗ Scene {scene_index:02d}: all retries failed, skipping image")
-    raise RuntimeError(f"Could not generate image for scene {scene_index}")
+    out_path.write_bytes(img_bytes)
+    log.info(f"Scene {scene_index:02d}: image saved ({len(img_bytes)//1024} KB)",
+             extra={"scene": scene_index})
+    return out_path

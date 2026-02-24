@@ -1,7 +1,7 @@
 """
 FFmpeg video composition:
   1. Ken Burns effect per scene image
-  2. Each image + narration audio → scene clip
+  2. Each image + narration audio -> scene clip
   3. All clips stitched with xfade crossfade
   4. SRT subtitle generation
   5. Subtitle burn into final video
@@ -11,6 +11,10 @@ import random
 import shutil
 import subprocess
 from pathlib import Path
+
+from pipeline.log import get_logger
+
+log = get_logger(__name__)
 
 FPS        = 24
 FADE_DUR   = 0.5   # crossfade duration between clips (seconds)
@@ -46,11 +50,22 @@ def make_scene_clip(
     scene_index: int,
     output_dir: Path,
 ) -> Path:
-    """Build one scene clip: Ken Burns image + narration audio."""
+    """Build one scene clip: Ken Burns image + narration audio.
+
+    Thread-safe — each scene writes to a unique output file.
+    """
     out = output_dir / f"clip_{scene_index:02d}.mp4"
     if out.exists():
-        print(f"  → Clip {scene_index:02d}: cached")
+        log.info(f"Clip {scene_index:02d}: cached")
         return out
+
+    # Validate inputs
+    if not image_path.exists():
+        raise FileNotFoundError(f"Scene {scene_index}: image not found: {image_path}")
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Scene {scene_index}: audio not found: {audio_path}")
+    if duration <= 0:
+        raise ValueError(f"Scene {scene_index}: invalid duration: {duration}")
 
     frames = int((duration + 0.5) * FPS)
     kb = random.choice(_KB_PRESETS)
@@ -73,14 +88,32 @@ def make_scene_clip(
         "-shortest",
         str(out),
     ])
-    print(f"  → Clip {scene_index:02d}: created ({duration:.1f}s)")
+
+    # Verify output
+    if not out.exists() or out.stat().st_size < 1000:
+        raise RuntimeError(f"Scene {scene_index}: clip generation produced invalid output")
+
+    log.info(f"Clip {scene_index:02d}: created ({duration:.1f}s)")
     return out
 
 
 def stitch_clips(clip_paths: list[Path], durations: list[float], output_dir: Path) -> Path:
-    """Chain clips with xfade dissolve transitions."""
+    """Chain clips with xfade dissolve transitions.
+
+    Validates all input clips before stitching.
+    """
     out = output_dir / "stitched.mp4"
     n = len(clip_paths)
+
+    # Validate all clips exist and are non-empty
+    for i, clip in enumerate(clip_paths):
+        if not clip.exists():
+            raise FileNotFoundError(f"Stitch: clip {i} not found: {clip}")
+        if clip.stat().st_size < 1000:
+            raise RuntimeError(f"Stitch: clip {i} is too small ({clip.stat().st_size} bytes): {clip}")
+
+    if n != len(durations):
+        raise ValueError(f"Stitch: {n} clips but {len(durations)} durations")
 
     if n == 1:
         shutil.copy(clip_paths[0], out)
@@ -98,6 +131,8 @@ def stitch_clips(clip_paths: list[Path], durations: list[float], output_dir: Pat
 
     for i in range(1, n):
         offset = cumulative + durations[i - 1] - FADE_DUR
+        # Guard against negative offsets (very short clips)
+        offset = max(0.0, offset)
         cumulative = offset + FADE_DUR
         nv = f"v{i}"
         na = f"a{i}"
@@ -124,6 +159,12 @@ def stitch_clips(clip_paths: list[Path], durations: list[float], output_dir: Pat
         "-c:a", "aac", "-b:a", "128k",
         str(out),
     ])
+
+    # Verify output
+    if not out.exists() or out.stat().st_size < 1000:
+        raise RuntimeError("Stitch: produced invalid output")
+
+    log.info(f"Stitched {n} clips -> {out.name}")
     return out
 
 
